@@ -1,13 +1,16 @@
 from pyspark.sql import SparkSession
 from src.configs.settings import settings
 import uuid
-from pyspark.sql.functions import col, udf
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType
 import psycopg2
 from psycopg2.extras import execute_batch
 
 
-# To add the gen_uuid method
-@udf("string")
+# Define the UUID UDF with a concrete DataType object so Airflow can import DAG files
+# before any SparkSession exists. Using @udf("string") can ask Spark to parse the type
+# at module import time and break DAG parsing with "SparkSession should be created first".
+@udf(returnType=StringType())
 def gen_uuid():
     return str(uuid.uuid4().hex[:20])
 
