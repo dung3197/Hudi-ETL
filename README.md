@@ -1,5 +1,5 @@
 # Hudi-ETL
-A Hudi ETL project that build data pipelines to process data from bronze to silver zone in medallion architect.
+A Hudi ETL project that build data pipelines to process data from bronze to silver zone in medallion architect. The bronze zone is a S3 bucket named 'staging' in which raw data synchronized using Oracle Golden Gate are stored. The silver zone refer to a bucket called 'warehouse' store the data that are transformed and cleansed.
 
 ## Introduction
 
