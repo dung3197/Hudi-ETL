@@ -2,9 +2,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from minio import Minio
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col
-from pyspark.sql.types import TimestampType
-from pyspark.sql.functions import lit, when, col, to_timestamp, unix_micros
+from pyspark.sql.functions import col, lit, when, to_timestamp, unix_micros
 from pyspark.sql.types import DateType, TimestampNTZType, TimestampType
 from functools import reduce
 
@@ -196,7 +194,7 @@ class TableETLBase(ABC):
         upsert_dfs = [insert_df, update_df, init_df]
         upsert_dfs = [df for df in upsert_dfs if not df.isEmpty()]
         final_upsert_df = reduce(DataFrame.unionAll, upsert_dfs)
-        final_upsert_df.sort(col("current_ts"))
+        final_upsert_df = final_upsert_df.sort(col("current_ts"))
 
         for field in final_upsert_df.schema.fields:
             if isinstance(field.dataType, time_types):
@@ -214,37 +212,76 @@ class TableETLBase(ABC):
                 final_upsert_df = final_upsert_df.withColumn(field.name, when(col(field.name) < marked_time, marked_time).otherwise(final_upsert_df[field.name]))
         print("Finish filter timestamp cols...")
 
-        #TODO: Logic check if c_customer_code and c_account_code in upcoming upsert batch exists in map table or not
-        
+        # Replace sensitive C_CUSTOMER_CODE values only for upsert dataframes that actually contain the column.
+        # Delete dataframes are intentionally excluded because delete handling does not need customer-code mapping.
+        if "C_CUSTOMER_CODE" in final_upsert_df.columns:
+            print("'--- Begin replacing C_CUSTOMER_CODE with C_CUSTOMER_CODE_MAP...")
+            final_upsert_df = self._replace_customer_code_with_map(final_upsert_df)
+            print("'--- Finish replacing C_CUSTOMER_CODE with C_CUSTOMER_CODE_MAP...")
+        else:
+            print("'--- C_CUSTOMER_CODE column not found; skipping customer-code mapping...")
+
+        return final_upsert_df, delete_df
+
+    def _read_customer_map(self) -> DataFrame:
+        # Read only the two required mapping columns from PostgreSQL to avoid loading unnecessary table data.
         jdbc_props = {
             "user": settings.map_pg_usr,
             "password": settings.map_pg_secret,
-            "driver": "org.postgresql.Driver"
+            "driver": settings.driver
         }
 
-        postgres_df = (
+        return (
             self.spark_session.read
                 .jdbc(
                     url=settings.jdbc_url,
                     table='''
                     (
-                        SELECT "C_CUSTOMER_CODE"
+                        SELECT
+                            "C_CUSTOMER_CODE",
+                            "C_CUSTOMER_CODE_MAP"
                         FROM public.t_cust_customer_map
                     ) tmp
                     ''',
                     properties=jdbc_props
                 )
+                .dropDuplicates(["C_CUSTOMER_CODE"])
         )
 
-        existing_df = df.join(postgres_df, df.C_CUSTOMER_CODE==postgres_df.C_CUSTOMER_CODE, "inner").drop(postgres_df["C_CUSTOMER_CODE"])
-        not_existing_cust_df = final_upsert_df.join(postgres_df,final_upsert_df.C_CUSTOMER_CODE==postgres_df.C_CUSTOMER_CODE,how="left_anti")
-        
-        # Handle not existing_df
-        if not not_existing_cust_df.isEmpty():
-            df_new_records_with_uuid = not_existing_cust_df.withColumn("C_CUSTOMER_CODE_MAP", gen_uuid())
-            df_new_records_with_uuid.foreachPartition(call_pg_function_partition)
+    def _replace_customer_code_with_map(self, final_upsert_df: DataFrame) -> DataFrame:
+        # Load the latest PostgreSQL customer map every time transform_data handles a C_CUSTOMER_CODE dataframe.
+        customer_map_df = self._read_customer_map()
 
-        return final_upsert_df, delete_df
+        # Keep only unique, non-null customer codes from the incoming upsert batch before checking PostgreSQL.
+        incoming_customer_codes_df = (
+            final_upsert_df
+                .select("C_CUSTOMER_CODE")
+                .where(col("C_CUSTOMER_CODE").isNotNull())
+                .distinct()
+        )
+
+        # Find only incoming customer codes that are not already present in public.t_cust_customer_map.
+        missing_customer_codes_df = incoming_customer_codes_df.join(
+            customer_map_df.select("C_CUSTOMER_CODE"),
+            on="C_CUSTOMER_CODE",
+            how="left_anti"
+        )
+
+        if not missing_customer_codes_df.isEmpty():
+            # Generate mapped values only for missing codes and let PostgreSQL ignore conflicts safely.
+            new_customer_map_df = missing_customer_codes_df.withColumn("C_CUSTOMER_CODE_MAP", gen_uuid())
+            new_customer_map_df.foreachPartition(call_pg_function_partition)
+
+            # Re-read PostgreSQL after inserts so concurrent conflict winners provide the authoritative map value.
+            customer_map_df = self._read_customer_map()
+
+        # Join the authoritative mapped value into the upsert dataframe, then remove the sensitive source code.
+        return (
+            final_upsert_df
+                .drop("C_CUSTOMER_CODE_MAP")
+                .join(customer_map_df, on="C_CUSTOMER_CODE", how="left")
+                .drop("C_CUSTOMER_CODE")
+        )
 
     @abstractmethod
     def create_hudi_options(self, write_operation) -> dict:
