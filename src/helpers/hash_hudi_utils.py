@@ -1,15 +1,21 @@
 from pyspark.sql import SparkSession
 from src.configs.settings import settings
 import uuid
-from pyspark.sql.functions import col, udf
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType
 import psycopg2
 from psycopg2.extras import execute_batch
 
 
-# To add the gen_uuid method
-@udf("string")
+# Keep the original uuid.uuid4().hex[:20] format, but create the Spark UDF lazily.
+# Airflow can import this module before SparkSession exists; gen_uuid() is called later during dataframe transforms.
 def gen_uuid():
-    return str(uuid.uuid4().hex[:20])
+    def _gen_uuid():
+        return str(uuid.uuid4().hex[:20])
+
+    # Use the keyword returnType form because some PySpark versions parse positional
+    # StringType() incorrectly as SQL text, which can raise PARSE_SYNTAX_ERROR.
+    return udf(_gen_uuid, returnType=StringType())()
 
 
 def call_pg_function_partition(rows):
