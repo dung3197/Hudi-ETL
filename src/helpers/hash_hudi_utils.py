@@ -3,19 +3,20 @@ from src.configs.settings import settings
 import uuid
 from pyspark.sql.functions import udf
 from pyspark.sql.types import StringType
-import psycopg2
-from psycopg2.extras import execute_batch
 
 
-# Define the UUID UDF with a concrete DataType object so Airflow can import DAG files
-# before any SparkSession exists. Using @udf("string") can ask Spark to parse the type
-# at module import time and break DAG parsing with "SparkSession should be created first".
-@udf(returnType=StringType())
 def gen_uuid():
-    return str(uuid.uuid4().hex[:20])
+    def _gen_uuid():
+        return str(uuid.uuid4().hex[:20])
+
+    # Create the UDF only when transform code calls gen_uuid(), after Spark already exists.
+    return udf(_gen_uuid, returnType=StringType())()
 
 
 def call_pg_function_partition(rows):
+    import psycopg2
+    from psycopg2.extras import execute_batch
+
     conn = psycopg2.connect(
         host=settings.map_pg_host,
         port=settings.map_pg_port,

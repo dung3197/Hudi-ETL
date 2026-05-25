@@ -312,7 +312,7 @@ class TableETLBase(ABC):
         if not missing_customer_codes_df.isEmpty():
             # Generate mapped values only for missing codes and let PostgreSQL ignore duplicate insert conflicts safely.
             new_customer_map_df = missing_customer_codes_df.withColumn(CUSTOMER_CODE_MAP_COLUMN, gen_uuid())
-            self._insert_customer_map_partitions(new_customer_map_df)
+            self._insert_customer_map_on_driver(new_customer_map_df)
 
             # Re-read PostgreSQL after inserts so concurrent conflict winners provide the authoritative map value.
             customer_map_df = self._read_customer_map()
@@ -336,64 +336,51 @@ class TableETLBase(ABC):
         # Drop the sensitive source value after every non-null customer code has a map value.
         return mapped_upsert_df.drop(CUSTOMER_CODE_COLUMN)
 
-    def _insert_customer_map_partitions(self, new_customer_map_df: DataFrame):
-        # Capture plain connection values on the driver; executors should not import the project-level settings module.
-        pg_host = settings.map_pg_host
-        pg_port = settings.map_pg_port
-        pg_database = settings.map_pg_database
-        pg_user = settings.map_pg_usr
-        pg_password = settings.map_pg_secret
-        customer_code_column = CUSTOMER_CODE_COLUMN
-        customer_code_map_column = CUSTOMER_CODE_MAP_COLUMN
+    def _insert_customer_map_on_driver(self, new_customer_map_df: DataFrame):
+        # Keep PostgreSQL writes on the driver so Spark executors do not need psycopg2 installed.
+        import psycopg2
+        from psycopg2.extras import execute_batch
 
-        def insert_partition(rows):
-            # Import third-party libraries inside the worker function so Spark executors only need psycopg2,
-            # not the whole project package named src, while executing foreachPartition.
-            import psycopg2
-            from psycopg2.extras import execute_batch
+        sql = """
+            SELECT public.safe_insert_t_cust_customer_map(
+                %s, %s
+            )
+        """
+        batch = []
+        conn = None
+        cur = None
 
-            sql = """
-                SELECT public.safe_insert_t_cust_customer_map(
-                    %s, %s
-                )
-            """
-            batch = []
-            conn = None
-            cur = None
+        try:
+            conn = psycopg2.connect(
+                host=settings.map_pg_host,
+                port=settings.map_pg_port,
+                database=settings.map_pg_database,
+                user=settings.map_pg_usr,
+                password=settings.map_pg_secret
+            )
+            conn.autocommit = False
+            cur = conn.cursor()
 
-            try:
-                conn = psycopg2.connect(
-                    host=pg_host,
-                    port=pg_port,
-                    database=pg_database,
-                    user=pg_user,
-                    password=pg_password
-                )
-                conn.autocommit = False
-                cur = conn.cursor()
+            # Stream Spark rows to the driver instead of collecting everything into memory at once.
+            for row in new_customer_map_df.select(CUSTOMER_CODE_COLUMN, CUSTOMER_CODE_MAP_COLUMN).toLocalIterator():
+                batch.append((
+                    row[CUSTOMER_CODE_COLUMN],
+                    row[CUSTOMER_CODE_MAP_COLUMN],
+                ))
 
-                for row in rows:
-                    batch.append((
-                        row[customer_code_column],
-                        row[customer_code_map_column],
-                    ))
-
-                    if len(batch) >= 5000:
-                        execute_batch(cur, sql, batch, page_size=5000)
-                        conn.commit()
-                        batch.clear()
-
-                if batch:
+                if len(batch) >= 5000:
                     execute_batch(cur, sql, batch, page_size=5000)
                     conn.commit()
-            finally:
-                if cur is not None:
-                    cur.close()
-                if conn is not None:
-                    conn.close()
+                    batch.clear()
 
-        # Run PostgreSQL inserts on Spark partitions without serializing a project-module function to executors.
-        new_customer_map_df.foreachPartition(insert_partition)
+            if batch:
+                execute_batch(cur, sql, batch, page_size=5000)
+                conn.commit()
+        finally:
+            if cur is not None:
+                cur.close()
+            if conn is not None:
+                conn.close()
 
     @abstractmethod
     def create_hudi_options(self, write_operation) -> dict:
