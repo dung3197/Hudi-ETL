@@ -2,7 +2,9 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from minio import Minio
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, lit, when, to_timestamp, unix_micros
+from pyspark.sql.functions import col
+from pyspark.sql.types import TimestampType
+from pyspark.sql.functions import lit, when, col, to_timestamp, unix_micros
 from pyspark.sql.types import DateType, TimestampNTZType, TimestampType
 from functools import reduce
 from typing import Optional, Tuple
@@ -187,52 +189,11 @@ class TableETLBase(ABC):
 
 
         print("'--- Joining Upserts...")
-        upsert_dfs = [df for df in [insert_df, update_df, init_df] if df is not None]
-        if upsert_dfs:
-            # Union by column name so insert/update/init branches stay aligned even if Spark returns fields in a different order.
-            final_upsert_df = reduce(lambda left_df, right_df: left_df.unionByName(right_df), upsert_dfs)
-            final_upsert_df = final_upsert_df.sort(col("current_ts"))
-            final_upsert_df = self._normalize_time_columns(final_upsert_df)
-            final_upsert_df = self._apply_customer_code_mapping_if_needed(final_upsert_df)
-        else:
-            # Return an empty flat dataframe so downstream table-specific transforms can still see the source schema.
-            print("'--- No upsert rows found; skipping upsert timestamp and customer-code transforms...")
-            final_upsert_df = self._empty_flat_dataframe(raw_data)
+        upsert_dfs = [insert_df, update_df, init_df]
+        upsert_dfs = [df for df in upsert_dfs if not df.isEmpty()]
+        final_upsert_df = reduce(DataFrame.unionAll, upsert_dfs)
+        final_upsert_df.sort(col("current_ts"))
 
-        return final_upsert_df, delete_df
-
-    def _flatten_ogg_dataframe_if_not_empty(
-        self,
-        ogg_processor: OGGCDCProcessor,
-        ogg_df: DataFrame,
-        op_type: str,
-        op_name: str
-    ) -> Optional[DataFrame]:
-        print(f"'--- Begin to flatten {op_name} df...")
-        if ogg_df.isEmpty():
-            print(f"'--- No {op_name} rows found; skip flattening...")
-            print(f"'--- Finish to flatten {op_name} df...")
-            return None
-
-        # OGG insert/update/init rows use the after payload; delete rows use the before payload.
-        flattened_df = ogg_processor.flat_dataframe(ogg_df, op_type)
-        print(f"'--- Finish to flatten {op_name} df...")
-        return flattened_df
-
-    def _empty_flat_dataframe(self, raw_data: DataFrame) -> DataFrame:
-        # Build a zero-row dataframe with flattened business columns for delete-only batches.
-        after_fields = raw_data.schema["after"].dataType.fieldNames() if "after" in raw_data.columns else []
-        before_fields = raw_data.schema["before"].dataType.fieldNames() if "before" in raw_data.columns else []
-        business_struct = "after" if len(after_fields) > 0 else "before"
-        business_fields = after_fields if len(after_fields) > 0 else before_fields
-
-        # Preserve the metadata columns such as op_type/current_ts while removing nested before/after structs.
-        business_exprs = [col(f"{business_struct}.{field}").alias(field) for field in sorted(business_fields)]
-        metadata_exprs = [col(name) for name in raw_data.columns if name not in ["before", "after"]]
-        return raw_data.limit(0).select(*(business_exprs + metadata_exprs))
-
-    def _normalize_time_columns(self, final_upsert_df: DataFrame) -> DataFrame:
-        # Shift source date/timestamp values to the project timezone offset before Hudi writes.
         for field in final_upsert_df.schema.fields:
             if isinstance(field.dataType, time_types):
                 col_name = field.name
@@ -250,150 +211,38 @@ class TableETLBase(ABC):
                 # Keep out-of-range timestamp values from breaking downstream storage/readers.
                 final_upsert_df = final_upsert_df.withColumn(field.name, when(col(field.name) < marked_time, marked_time).otherwise(final_upsert_df[field.name]))
         print("Finish filter timestamp cols...")
-        return final_upsert_df
 
-    def _apply_customer_code_mapping_if_needed(self, final_upsert_df: DataFrame) -> DataFrame:
-        # Only upsert dataframes containing the sensitive customer code need PostgreSQL mapping.
-        if CUSTOMER_CODE_COLUMN in final_upsert_df.columns:
-            print(f"'--- Begin replacing {CUSTOMER_CODE_COLUMN} with {CUSTOMER_CODE_MAP_COLUMN}...")
-            final_upsert_df = self._replace_customer_code_with_map(final_upsert_df)
-            print(f"'--- Finish replacing {CUSTOMER_CODE_COLUMN} with {CUSTOMER_CODE_MAP_COLUMN}...")
-        else:
-            print(f"'--- {CUSTOMER_CODE_COLUMN} column not found; skipping customer-code mapping...")
-        return final_upsert_df
-
-    def _read_customer_map(self) -> DataFrame:
-        # Read only the two required mapping columns from PostgreSQL to avoid loading unnecessary table data.
+        #TODO: Logic check if c_customer_code and c_account_code in upcoming upsert batch exists in map table or not
+        
         jdbc_props = {
             "user": settings.map_pg_usr,
             "password": settings.map_pg_secret,
-            "driver": settings.driver
+            "driver": "org.postgresql.Driver"
         }
 
-        customer_map_query = f'''
-                    (
-                        SELECT
-                            "{CUSTOMER_CODE_COLUMN}",
-                            "{CUSTOMER_CODE_MAP_COLUMN}"
-                        FROM {CUSTOMER_MAP_TABLE}
-                    ) customer_map
-                    '''
-
-        return (
+        postgres_df = (
             self.spark_session.read
                 .jdbc(
                     url=settings.jdbc_url,
-                    table=customer_map_query,
+                    table='''
+                    (
+                        SELECT "C_CUSTOMER_CODE"
+                        FROM public.t_cust_customer_map
+                    ) tmp
+                    ''',
                     properties=jdbc_props
                 )
-                .where(col(CUSTOMER_CODE_COLUMN).isNotNull())
-                .dropDuplicates([CUSTOMER_CODE_COLUMN])
         )
 
-    def _replace_customer_code_with_map(self, final_upsert_df: DataFrame) -> DataFrame:
-        # Load the latest PostgreSQL customer map every time transform_data handles a C_CUSTOMER_CODE upsert dataframe.
-        customer_map_df = self._read_customer_map()
+        existing_df = df.join(postgres_df, df.C_CUSTOMER_CODE==postgres_df.C_CUSTOMER_CODE, "inner").drop(postgres_df["C_CUSTOMER_CODE"])
+        not_existing_cust_df = final_upsert_df.join(postgres_df,final_upsert_df.C_CUSTOMER_CODE==postgres_df.C_CUSTOMER_CODE,how="left_anti")
+        
+        # Handle not existing_df
+        if not not_existing_cust_df.isEmpty():
+            df_new_records_with_uuid = not_existing_cust_df.withColumn("C_CUSTOMER_CODE_MAP", gen_uuid())
+            df_new_records_with_uuid.foreachPartition(call_pg_function_partition)
 
-        # Keep only unique, non-null customer codes from the incoming upsert batch before checking PostgreSQL.
-        incoming_customer_codes_df = (
-            final_upsert_df
-                .select(CUSTOMER_CODE_COLUMN)
-                .where(col(CUSTOMER_CODE_COLUMN).isNotNull())
-                .distinct()
-        )
-
-        # Find only incoming customer codes that are not already present in the PostgreSQL map table.
-        missing_customer_codes_df = incoming_customer_codes_df.join(
-            customer_map_df.select(CUSTOMER_CODE_COLUMN),
-            on=CUSTOMER_CODE_COLUMN,
-            how="left_anti"
-        )
-
-        if not missing_customer_codes_df.isEmpty():
-            # Generate mapped values only for missing codes and let PostgreSQL ignore duplicate insert conflicts safely.
-            new_customer_map_df = missing_customer_codes_df.withColumn(CUSTOMER_CODE_MAP_COLUMN, gen_uuid())
-            self._insert_customer_map_partitions(new_customer_map_df)
-
-            # Re-read PostgreSQL after inserts so concurrent conflict winners provide the authoritative map value.
-            customer_map_df = self._read_customer_map()
-
-        # Join the authoritative mapped value into the upsert dataframe and remove any stale map column from the source.
-        mapped_upsert_df = (
-            final_upsert_df
-                .drop(CUSTOMER_CODE_MAP_COLUMN)
-                .join(customer_map_df, on=CUSTOMER_CODE_COLUMN, how="left")
-        )
-
-        unmapped_customer_df = (
-            mapped_upsert_df
-                .where(col(CUSTOMER_CODE_COLUMN).isNotNull() & col(CUSTOMER_CODE_MAP_COLUMN).isNull())
-                .select(CUSTOMER_CODE_COLUMN)
-                .limit(1)
-        )
-        if not unmapped_customer_df.isEmpty():
-            raise ValueError(f"{CUSTOMER_MAP_TABLE} did not return a mapped value for at least one incoming {CUSTOMER_CODE_COLUMN}")
-
-        # Drop the sensitive source value after every non-null customer code has a map value.
-        return mapped_upsert_df.drop(CUSTOMER_CODE_COLUMN)
-
-    def _insert_customer_map_partitions(self, new_customer_map_df: DataFrame):
-        # Capture plain connection values on the driver; executors should not import the project-level settings module.
-        pg_host = settings.map_pg_host
-        pg_port = settings.map_pg_port
-        pg_database = settings.map_pg_database
-        pg_user = settings.map_pg_usr
-        pg_password = settings.map_pg_secret
-        customer_code_column = CUSTOMER_CODE_COLUMN
-        customer_code_map_column = CUSTOMER_CODE_MAP_COLUMN
-
-        def insert_partition(rows):
-            # Import third-party libraries inside the worker function so Spark executors only need psycopg2,
-            # not the whole project package named src, while executing foreachPartition.
-            import psycopg2
-            from psycopg2.extras import execute_batch
-
-            sql = """
-                SELECT public.safe_insert_t_cust_customer_map(
-                    %s, %s
-                )
-            """
-            batch = []
-            conn = None
-            cur = None
-
-            try:
-                conn = psycopg2.connect(
-                    host=pg_host,
-                    port=pg_port,
-                    database=pg_database,
-                    user=pg_user,
-                    password=pg_password
-                )
-                conn.autocommit = False
-                cur = conn.cursor()
-
-                for row in rows:
-                    batch.append((
-                        row[customer_code_column],
-                        row[customer_code_map_column],
-                    ))
-
-                    if len(batch) >= 5000:
-                        execute_batch(cur, sql, batch, page_size=5000)
-                        conn.commit()
-                        batch.clear()
-
-                if batch:
-                    execute_batch(cur, sql, batch, page_size=5000)
-                    conn.commit()
-            finally:
-                if cur is not None:
-                    cur.close()
-                if conn is not None:
-                    conn.close()
-
-        # Run PostgreSQL inserts on Spark partitions without serializing a project-module function to executors.
-        new_customer_map_df.foreachPartition(insert_partition)
+        return final_upsert_df, delete_df
 
     @abstractmethod
     def create_hudi_options(self, write_operation) -> dict:
