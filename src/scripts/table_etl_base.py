@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
+import os
 from minio import Minio
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import col
@@ -22,6 +23,8 @@ offset = timedelta(hours=TIMEZONE_OFFSET_HOURS)
 CUSTOMER_CODE_COLUMN = "C_CUSTOMER_CODE"
 CUSTOMER_CODE_MAP_COLUMN = "C_CUSTOMER_CODE_MAP"
 CUSTOMER_MAP_TABLE = "public.t_cust_customer_map"
+SINGLE_FILE_BATCH_TABLE = "T_MU_LOAN_FLOW_FEE"
+SINGLE_FILE_BATCH_ENV = "T_MU_LOAN_FLOW_FEE_SINGLE_BATCH_FILE"
 
 class TableETLBase(ABC):
 
@@ -53,7 +56,7 @@ class TableETLBase(ABC):
             print('All_files:', all_files)
 
             if len(all_files) > 0:
-                file_batches = [all_files[i:i + settings.s3_batch_size] for i in range(0, len(all_files), settings.s3_batch_size)]
+                file_batches = self._create_file_batches(all_files)
                 spark_write_mode = "overwrite" if self.overwrite == True else "append"
                 batch_idx = 0
 
@@ -103,6 +106,52 @@ class TableETLBase(ABC):
         print("------------------------------------------------\n")
 
         return self.source_table, total_duration, total_records, process_data_success, st
+
+    def _create_file_batches(self, all_files):
+        single_file_batch_objects = self._single_file_batch_objects()
+        if len(single_file_batch_objects) == 0:
+            # Default behavior: split the MinIO object list by the global S3 batch size.
+            return [all_files[i:i + settings.s3_batch_size] for i in range(0, len(all_files), settings.s3_batch_size)]
+
+        file_batches = []
+        current_batch = []
+
+        for obj in all_files:
+            if self._is_single_file_batch_object(obj, single_file_batch_objects):
+                # Flush pending normal files first so the original last_modified ordering is preserved.
+                if len(current_batch) > 0:
+                    file_batches.append(current_batch)
+                    current_batch = []
+
+                # The configured special file must always run as its own one-file batch.
+                file_batches.append([obj])
+                print(f"Single-file batch applied for {self.source_table}: {obj}")
+                continue
+
+            current_batch.append(obj)
+            if len(current_batch) >= settings.s3_batch_size:
+                file_batches.append(current_batch)
+                current_batch = []
+
+        if len(current_batch) > 0:
+            file_batches.append(current_batch)
+
+        return file_batches
+
+    def _single_file_batch_objects(self):
+        if self.source_table.upper() != SINGLE_FILE_BATCH_TABLE:
+            return set()
+
+        configured_files = os.getenv(SINGLE_FILE_BATCH_ENV, "")
+        return set(
+            item.strip()
+            for item in configured_files.replace(";", ",").split(",")
+            if item.strip() != ""
+        )
+
+    def _is_single_file_batch_object(self, obj, single_file_batch_objects):
+        # Accept either the full MinIO object path or only its basename in the table-specific setting.
+        return obj in single_file_batch_objects or obj.split("/")[-1] in single_file_batch_objects
 
     def extract_data(self, objs)-> DataFrame:
         if len(objs) > 0:
